@@ -16,7 +16,7 @@ import asyncio
 import logging
 import os
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -36,6 +36,7 @@ class JobStatus(Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -109,8 +110,29 @@ class JobStore:
         async with self._lock:
             self._jobs.pop(job_id, None)
 
+    async def cancel(self, job_id: str) -> bool:
+        """Cancel an active background job.
+
+        Returns True if the job was cancelled, False if not found
+        or already in a terminal state.
+        """
+        async with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None:
+                return False
+            if record.status not in (JobStatus.STARTING, JobStatus.RUNNING):
+                return False
+            now = datetime.now(timezone.utc).isoformat()
+            self._jobs[job_id] = replace(
+                record,
+                status=JobStatus.CANCELLED,
+                completed_at=now,
+                error="Job cancelled by user",
+            )
+            return True
+
     async def cleanup_completed(self, max_age: float) -> int:
-        """Remove completed/failed jobs older than max_age seconds.
+        """Remove completed/failed/cancelled jobs older than max_age seconds.
 
         Returns:
             Number of jobs removed.
@@ -120,7 +142,11 @@ class JobStore:
         async with self._lock:
             to_remove = []
             for job_id, record in self._jobs.items():
-                if record.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
+                if record.status not in (
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                ):
                     continue
                 if record.completed_at is None:
                     continue
@@ -145,7 +171,7 @@ class JobStore:
 async def run_background_job(
     job_store: JobStore,
     job_id: str,
-    run_fn: Callable[..., tuple[str, str, int]],
+    run_fn: Callable[..., tuple[str, str, int, float]],
     *,
     code: str,
     accelerator: str,
@@ -163,7 +189,7 @@ async def run_background_job(
     Args:
         job_store: The JobStore instance to update.
         job_id: ID of the job to run.
-        run_fn: Blocking function (code, accelerator, high_memory, timeout) -> (stdout, stderr, rc).
+        run_fn: Blocking function (code, accelerator, high_memory, timeout) -> (stdout, stderr, rc, elapsed).
         code: The wrapped code to execute.
         accelerator: GPU/TPU type.
         high_memory: Whether high-memory mode is enabled.
@@ -172,11 +198,11 @@ async def run_background_job(
     """
     try:
         await job_store.update(job_id, status=JobStatus.RUNNING)
-        stdout, stderr, rc = await asyncio.to_thread(
+        stdout, stderr, rc, elapsed = await asyncio.to_thread(
             run_fn, code, accelerator, high_memory, timeout,
         )
         now = datetime.now(timezone.utc).isoformat()
-        result_json = format_result_fn(stdout, stderr, rc)
+        result_json = format_result_fn(stdout, stderr, rc, elapsed)
         await job_store.update(
             job_id,
             status=JobStatus.COMPLETED,

@@ -2,6 +2,7 @@
 
 Covers:
 - JobStore: create, update (immutability), get, active_job_id, cleanup, reject when active
+- JobStore.cancel: active job, non-existent, completed, already cancelled
 - run_background_job: success lifecycle, failure lifecycle, runtime always released
 - colab_execute(background=True): returns job_id, rejects when active, rejects with drive
 - colab_poll: all statuses, unknown job_id
@@ -164,6 +165,73 @@ class TestJobStore:
         removed = await store.cleanup_completed(max_age=0)
         assert removed == 0
 
+    # --- cancel tests ---
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_job(self, store: JobStore):
+        """cancel() on STARTING/RUNNING job returns True and sets CANCELLED."""
+        job_id = await store.create_if_no_active("T4")
+        result = await store.cancel(job_id)
+        assert result is True
+        record = await store.get(job_id)
+        assert record is not None
+        assert record.status == JobStatus.CANCELLED
+        assert record.completed_at is not None
+        assert record.error == "Job cancelled by user"
+
+    @pytest.mark.asyncio
+    async def test_cancel_running_job(self, store: JobStore):
+        job_id = await store.create_if_no_active("T4")
+        await store.update(job_id, status=JobStatus.RUNNING)
+        result = await store.cancel(job_id)
+        assert result is True
+        record = await store.get(job_id)
+        assert record.status == JobStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_cancel_nonexistent_returns_false(self, store: JobStore):
+        result = await store.cancel("does-not-exist")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_completed_returns_false(self, store: JobStore):
+        job_id = await store.create_if_no_active("T4")
+        await store.update(
+            job_id,
+            status=JobStatus.COMPLETED,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        result = await store.cancel(job_id)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_already_cancelled_returns_false(self, store: JobStore):
+        job_id = await store.create_if_no_active("T4")
+        first = await store.cancel(job_id)
+        assert first is True
+        second = await store.cancel(job_id)
+        assert second is False
+
+    @pytest.mark.asyncio
+    async def test_cleanup_removes_cancelled(self, store: JobStore):
+        """CANCELLED jobs should be cleaned up by cleanup_completed."""
+        job_id = await store.create_if_no_active("T4")
+        await store.cancel(job_id)
+        # Override completed_at to far in the past
+        await store.update(job_id, completed_at="2020-01-01T00:00:00+00:00")
+        removed = await store.cleanup_completed(max_age=1.0)
+        assert removed == 1
+        assert await store.get(job_id) is None
+
+    @pytest.mark.asyncio
+    async def test_create_allowed_after_cancel(self, store: JobStore):
+        """Cancelling a job frees the slot for a new active job."""
+        job_id = await store.create_if_no_active("T4")
+        await store.cancel(job_id)
+        second = await store.create_if_no_active("A100")
+        assert second is not None
+        assert second != job_id
+
 
 # ---------------------------------------------------------------------------
 # JobRecord frozen dataclass tests
@@ -213,9 +281,9 @@ class TestRunBackgroundJob:
         fake_rc = 0
 
         def mock_run(code, accel, hm, tout):
-            return (fake_stdout, fake_stderr, fake_rc)
+            return (fake_stdout, fake_stderr, fake_rc, 1.0)
 
-        def mock_format(stdout, stderr, rc):
+        def mock_format(stdout, stderr, rc, elapsed=0.0):
             return json.dumps({"stdout": stdout, "exit_code": rc})
 
         with patch("mcp_colab_gpu.background._schedule_cleanup"):
@@ -244,7 +312,7 @@ class TestRunBackgroundJob:
         def mock_run(code, accel, hm, tout):
             raise RuntimeError("GPU allocation failed")
 
-        def mock_format(stdout, stderr, rc):
+        def mock_format(stdout, stderr, rc, elapsed=0.0):
             return json.dumps({"exit_code": rc})
 
         with patch("mcp_colab_gpu.background._schedule_cleanup"):
@@ -268,9 +336,9 @@ class TestRunBackgroundJob:
         job_id = await store.create_if_no_active("T4")
 
         def mock_run(code, accel, hm, tout):
-            return ("out", "", 0)
+            return ("out", "", 0, 0.1)
 
-        def mock_format(stdout, stderr, rc):
+        def mock_format(stdout, stderr, rc, elapsed=0.0):
             return json.dumps({"exit_code": rc})
 
         with patch("mcp_colab_gpu.background._schedule_cleanup") as mock_sched:
@@ -292,7 +360,7 @@ class TestRunBackgroundJob:
         def mock_run(code, accel, hm, tout):
             raise ValueError("boom")
 
-        def mock_format(stdout, stderr, rc):
+        def mock_format(stdout, stderr, rc, elapsed=0.0):
             return json.dumps({"exit_code": rc})
 
         with patch("mcp_colab_gpu.background._schedule_cleanup") as mock_sched:
@@ -318,7 +386,7 @@ class TestColabExecuteBackground:
     @pytest.mark.asyncio
     async def test_background_returns_job_id(self):
         with patch("mcp_colab_gpu.server._run_on_colab") as mock_run:
-            mock_run.return_value = ("out", "", 0)
+            mock_run.return_value = ("out", "", 0, 0.5)
             # Reset store for test isolation
             from mcp_colab_gpu import server as srv
             srv._job_store = JobStore()
@@ -394,6 +462,7 @@ class TestColabExecuteBackground:
                 '===CELL_START_0===\nhello\n===CELL_END_0===',
                 "",
                 0,
+                1.0,
             )
             from mcp_colab_gpu import server as srv
             srv._job_store = JobStore()

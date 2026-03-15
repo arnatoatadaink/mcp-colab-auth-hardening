@@ -4,8 +4,10 @@ Exposes tools via the FastMCP API:
 - colab_execute: Run inline Python code on a Colab GPU/TPU (sync or background)
 - colab_execute_file: Run a local .py file on a Colab GPU/TPU
 - colab_execute_notebook: Run code and collect generated artifacts
+- colab_cancel: Cancel an active background job
 - colab_poll: Poll a background job for status and results
 - colab_jobs: List all tracked background jobs
+- colab_status: Return server status, accelerator info, and recent jobs
 - colab_drive_upload: Upload a local file to Google Drive
 - colab_drive_download: Download a file from Google Drive
 - colab_version: Return the server version
@@ -20,11 +22,13 @@ import json
 import os
 import pathlib
 import re
+import time
 import zipfile
 
 from mcp.server.fastmcp import FastMCP
 
 from .background import JobStatus, JobStore, run_background_job
+from .error_analysis import enrich_result
 from .colab_runtime import (
     allocate_runtime,
     create_session,
@@ -43,7 +47,7 @@ ARTIFACT_B64_START = "ARTIFACT_BASE64_START"
 ARTIFACT_B64_END = "ARTIFACT_BASE64_END"
 
 _job_store = JobStore()
-_background_tasks: set[asyncio.Task] = set()
+_background_tasks: dict[str, asyncio.Task] = {}
 
 
 def _wrap_cells(code: str) -> tuple[str, int]:
@@ -97,17 +101,21 @@ def _strip_artifact_b64(stdout: str) -> str:
     return re.sub(pattern, "", stdout, flags=re.DOTALL)
 
 
-def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int]:
+def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int, float]:
     """Blocking function that allocates a runtime, executes code, and releases.
 
     This runs in a thread via asyncio.to_thread() for both sync and background paths.
     The runtime is ALWAYS released in the finally block.
+
+    Returns:
+        Tuple of (stdout, stderr, exit_code, elapsed_seconds).
     """
     validate_params(accelerator, timeout)
     creds = get_credentials()
     access_token = creds.token
     assignment = allocate_runtime(access_token, accelerator, high_memory)
     stop_event = start_keepalive(access_token, assignment["endpoint"])
+    start_time = time.monotonic()
     try:
         kernel_id = create_session(assignment["proxy_url"], assignment["proxy_token"])
         stdout, stderr, exit_code = execute_code(
@@ -117,14 +125,26 @@ def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) 
     finally:
         stop_event.set()
         unassign_runtime(access_token, assignment["endpoint"])
-    return stdout, stderr, exit_code
+    elapsed = round(time.monotonic() - start_time, 2)
+    return stdout, stderr, exit_code, elapsed
 
 
-def _format_sync_result(stdout: str, stderr: str, rc: int, num_cells: int) -> str:
+def _format_sync_result(
+    stdout: str,
+    stderr: str,
+    rc: int,
+    num_cells: int,
+    *,
+    session_info: dict | None = None,
+) -> str:
     """Format execution results into the standard JSON response."""
     cells = _parse_cell_output(stdout, num_cells)
     errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
-    return json.dumps({"cells": cells, "errors": errors, "stderr": stderr, "exit_code": rc}, indent=2)
+    result: dict = {"cells": cells, "errors": errors, "stderr": stderr, "exit_code": rc}
+    if session_info is not None:
+        result["session_info"] = session_info
+    result = enrich_result(result, stderr, rc)
+    return json.dumps(result, indent=2)
 
 
 def _validate_file_path(raw: str) -> pathlib.Path:
@@ -213,8 +233,9 @@ async def colab_execute(
                 "active_job_id": active,
             })
         wrapped, num_cells = _wrap_cells(code)
-        def _format_bg_result(stdout: str, stderr: str, rc: int) -> str:
-            return _format_sync_result(stdout, stderr, rc, num_cells)
+        def _format_bg_result(stdout: str, stderr: str, rc: int, elapsed: float) -> str:
+            info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+            return _format_sync_result(stdout, stderr, rc, num_cells, session_info=info)
         task = asyncio.create_task(run_background_job(
             _job_store,
             job_id,
@@ -225,18 +246,19 @@ async def colab_execute(
             timeout=timeout,
             format_result_fn=_format_bg_result,
         ))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        _background_tasks[job_id] = task
+        task.add_done_callback(lambda t, jid=job_id: _background_tasks.pop(jid, None))
         return json.dumps({"job_id": job_id, "status": "starting"})
     if fetch_map or save_map:
         return await asyncio.to_thread(
             _execute_with_drive, code, accelerator, high_memory, timeout, fetch_map, save_map,
         )
     wrapped, num_cells = _wrap_cells(code)
-    stdout, stderr, rc = await asyncio.to_thread(
+    stdout, stderr, rc, elapsed = await asyncio.to_thread(
         _run_on_colab, wrapped, accelerator, high_memory, timeout,
     )
-    return _format_sync_result(stdout, stderr, rc, num_cells)
+    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+    return _format_sync_result(stdout, stderr, rc, num_cells, session_info=session_info)
 
 
 def _execute_with_drive(
@@ -267,6 +289,7 @@ def _execute_with_drive(
     access_token = creds.token
     assignment = allocate_runtime(access_token, accelerator, high_memory)
     stop_event = start_keepalive(access_token, assignment["endpoint"])
+    start_time = time.monotonic()
     try:
         kernel_id = create_session(assignment["proxy_url"], assignment["proxy_token"])
         # --- Step 1: Drive fetch (pre-execution) ---
@@ -329,13 +352,44 @@ def _execute_with_drive(
     finally:
         stop_event.set()
         unassign_runtime(access_token, assignment["endpoint"])
-    result = {
+    elapsed = round(time.monotonic() - start_time, 2)
+    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+    result: dict = {
         "cells": cells, "errors": errors + drive_errors,
         "stderr": stderr, "exit_code": rc,
+        "session_info": session_info,
     }
     if drive_saved:
         result["drive_saved"] = drive_saved
+    result = enrich_result(result, stderr, rc)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def colab_cancel(job_id: str) -> str:
+    """Cancel an active background job.
+
+    Marks the job as cancelled and attempts to cancel the underlying
+    asyncio task. Use colab_jobs to find the job_id.
+
+    Args:
+        job_id: The job identifier returned by colab_execute.
+    """
+    cancelled = await _job_store.cancel(job_id)
+    if not cancelled:
+        record = await _job_store.get(job_id)
+        if record is None:
+            return json.dumps({"error": f"Unknown job_id: {job_id}"})
+        return json.dumps({
+            "error": f"Cannot cancel job in '{record.status.value}' state",
+            "job_id": job_id,
+            "status": record.status.value,
+        })
+    # Cancel the asyncio task if it is still running.
+    bg_task = _background_tasks.pop(job_id, None)
+    if bg_task is not None and not bg_task.done():
+        bg_task.cancel()
+    return json.dumps({"job_id": job_id, "status": "cancelled"})
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
@@ -363,6 +417,8 @@ async def colab_poll(job_id: str) -> str:
     if record.status == JobStatus.COMPLETED and record.result is not None:
         info["result"] = json.loads(record.result)
     if record.status == JobStatus.FAILED and record.error is not None:
+        info["error"] = record.error
+    if record.status == JobStatus.CANCELLED and record.error is not None:
         info["error"] = record.error
     return json.dumps(info, indent=2)
 
@@ -422,10 +478,11 @@ async def colab_execute_file(
         return json.dumps({"error": str(e)})
     code = resolved.read_text()
     wrapped, num_cells = _wrap_cells(code)
-    stdout, stderr, rc = await asyncio.to_thread(
+    stdout, stderr, rc, elapsed = await asyncio.to_thread(
         _run_on_colab, wrapped, accelerator, high_memory, timeout,
     )
-    return _format_sync_result(stdout, stderr, rc, num_cells)
+    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+    return _format_sync_result(stdout, stderr, rc, num_cells, session_info=session_info)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -504,9 +561,10 @@ else:
 '''
     full_code = code + "\n\n" + artifact_code
     wrapped, num_cells = _wrap_cells(full_code)
-    stdout, stderr, rc = await asyncio.to_thread(
+    stdout, stderr, rc, elapsed = await asyncio.to_thread(
         _run_on_colab, wrapped, accelerator, high_memory, timeout,
     )
+    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
     # Extract artifact base64 before stripping it from stdout.
     b64_data = _extract_artifact_b64(stdout)
     # Strip the base64 block so it does not leak into cell output JSON,
@@ -525,10 +583,13 @@ else:
             artifact_files = _safe_extract_zip(artifacts_zip_path, output_dir)
         except Exception as e:
             errors.append({"artifact_error": str(e)})
-    return json.dumps({
+    result: dict = {
         "cells": cells, "errors": errors, "artifacts_zip": artifacts_zip_path,
         "artifact_files": artifact_files, "stderr": stderr, "exit_code": rc,
-    }, indent=2)
+        "session_info": session_info,
+    }
+    result = enrich_result(result, stderr, rc)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -602,6 +663,57 @@ async def colab_drive_download(
         return json.dumps({"error": str(e)})
     except Exception as e:
         return json.dumps({"error": f"Drive download failed: {e}"})
+
+
+_ACCELERATOR_INFO: dict[str, dict[str, str]] = {
+    "T4": {"vram": "16 GB", "tier": "free"},
+    "L4": {"vram": "22 GB", "tier": "pro"},
+    "A100": {"vram": "40 GB", "tier": "pro/pro+"},
+    "H100": {"vram": "80 GB", "tier": "pro+"},
+    "G4": {"vram": "95 GB", "tier": "pro+"},
+    "V5E1": {"type": "TPU v5e-1", "tier": "pro+"},
+    "V6E1": {"type": "TPU v6e-1", "tier": "pro+"},
+}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def colab_status() -> str:
+    """Return current server status including accelerator info and job state.
+
+    Provides supported accelerator types with their specifications,
+    the currently active background job (if any), and recent executions.
+    """
+    active_id = await _job_store.active_job_id()
+    active_job = None
+    if active_id is not None:
+        record = await _job_store.get(active_id)
+        if record is not None:
+            active_job = {
+                "job_id": record.job_id,
+                "status": record.status.value,
+                "accelerator": record.accelerator,
+                "created_at": record.created_at,
+            }
+    all_records = await _job_store.list_all()
+    terminal = [
+        r for r in all_records
+        if r.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+    ]
+    terminal.sort(key=lambda r: r.completed_at or "", reverse=True)
+    recent = [
+        {
+            "job_id": r.job_id,
+            "status": r.status.value,
+            "accelerator": r.accelerator,
+            "completed_at": r.completed_at,
+        }
+        for r in terminal[:5]
+    ]
+    return json.dumps({
+        "supported_accelerators": _ACCELERATOR_INFO,
+        "active_job": active_job,
+        "recent_executions": recent,
+    }, indent=2)
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
