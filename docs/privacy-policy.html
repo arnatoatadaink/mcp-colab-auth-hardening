@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy — mcp-colab-gpu</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.7; color: #1a1a1a; background: #fff; max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem; }
+    h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+    h2 { font-size: 1.3rem; margin-top: 2rem; margin-bottom: 0.75rem; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3rem; }
+    h3 { font-size: 1.1rem; margin-top: 1.25rem; margin-bottom: 0.5rem; }
+    p, li { margin-bottom: 0.5rem; color: #333; }
+    ul { padding-left: 1.5rem; margin-bottom: 1rem; }
+    a { color: #0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: #f6f8fa; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.9em; }
+    .updated { color: #666; font-size: 0.9rem; margin-bottom: 2rem; }
+    .back { display: inline-block; margin-bottom: 1.5rem; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <a href="/" class="back">&larr; mcp-colab-gpu</a>
+  <h1>Privacy Policy</h1>
+  <p class="updated">Last updated: 2026-03-21</p>
+
+  <h2>Overview</h2>
+  <p>mcp-colab-gpu is an open-source MCP (Model Context Protocol) server that enables AI coding assistants to execute Python code on Google Colab GPU/TPU runtimes. This privacy policy explains how the application handles user data when accessing Google services.</p>
+
+  <h2>Data We Access</h2>
+
+  <h3>Google Colab</h3>
+  <ul>
+    <li>The application allocates and releases Colab runtimes on your behalf.</li>
+    <li>Python code you provide is sent to the Colab runtime for execution.</li>
+    <li>Execution output (stdout, stderr, exit codes) is returned to your local AI coding assistant.</li>
+  </ul>
+
+  <h3>Google Drive (Optional)</h3>
+  <ul>
+    <li>The application requests the <code>drive.file</code> scope, which provides access <strong>only to files created or opened by this application</strong>.</li>
+    <li>The application <strong>cannot</strong> access your existing Google Drive files, photos, documents, or any other data not created by mcp-colab-gpu.</li>
+    <li>Drive access is used solely to transfer files between your local machine and Colab runtimes (upload input data, download results).</li>
+  </ul>
+
+  <h2>Data Storage</h2>
+  <ul>
+    <li><strong>No server-side storage.</strong> mcp-colab-gpu runs entirely on your local machine. No data is sent to any third-party server operated by the developers.</li>
+    <li><strong>OAuth tokens</strong> are cached locally at <code>~/.config/colab-exec/</code> with restrictive file permissions (<code>0600</code>). Tokens are short-lived and automatically refreshed.</li>
+    <li><strong>No telemetry or analytics.</strong> The application does not collect usage data, crash reports, or any other telemetry.</li>
+  </ul>
+
+  <h2>Data Sharing</h2>
+  <ul>
+    <li>The developers do not receive, store, or broker your code, files, or execution results.</li>
+    <li>When you use Colab or Drive features, that data is transmitted directly from your local machine to Google's APIs over encrypted connections (HTTPS/WSS). Your use of Google services is governed by <a href="https://policies.google.com/privacy">Google's Privacy Policy</a>.</li>
+  </ul>
+
+  <h2>Data Retention</h2>
+  <ul>
+    <li>The application does not retain any user data beyond the local token cache.</li>
+    <li>You can revoke access at any time by removing the cached tokens at <code>~/.config/colab-exec/</code> or by revoking the application's access in your <a href="https://myaccount.google.com/permissions">Google Account permissions</a>.</li>
+  </ul>
+
+  <h2>Security</h2>
+  <ul>
+    <li>All communication with Google APIs uses HTTPS/WSS encryption.</li>
+    <li>OAuth tokens are stored with owner-only file permissions.</li>
+    <li>The application uses the minimal required OAuth scope (<code>drive.file</code>) to limit access.</li>
+  </ul>
+
+  <h2>Open Source</h2>
+  <p>mcp-colab-gpu is open-source software licensed under the MIT License. The source code is publicly available at: <a href="https://github.com/mio-github/mcp-colab-gpu">https://github.com/mio-github/mcp-colab-gpu</a></p>
+
+  <h2>Contact</h2>
+  <p>For questions or concerns about this privacy policy, please open an issue on the GitHub repository: <a href="https://github.com/mio-github/mcp-colab-gpu/issues">https://github.com/mio-github/mcp-colab-gpu/issues</a></p>
+
+  <h2>Changes</h2>
+  <p>We may update this privacy policy from time to time. Changes will be reflected in the "Last updated" date above and committed to the repository.</p>
+</body>
+</html>
