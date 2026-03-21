@@ -4,24 +4,28 @@ version = "0.3.1"
 description = "MCP server for executing Python on Google Colab GPU/TPU runtimes — supports all Colab Pro accelerators (T4/L4/A100/H100/G4) with high-memory option and security hardening. Fork of mcp-server-colab-exec by Paritosh Dwivedi."
 requires-python = ">=3.10"
 license = "MIT"
-authors = [
-    {name = "Masaya Hirano"},
+authors = [{ name = "Masaya Hirano" }]
+maintainers = [{ name = "Masaya Hirano" }]
+keywords = [
+  "colab",
+  "cuda",
+  "gpu",
+  "tpu",
+  "machine-learning",
+  "mcp",
+  "colab-pro",
 ]
-maintainers = [
-    {name = "Masaya Hirano"},
-]
-keywords = ["colab", "cuda", "gpu", "tpu", "machine-learning", "mcp", "colab-pro"]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "google-auth>=2.0",
-    "google-auth-oauthlib>=1.0",
-    "mcp[cli]>=1.6.0",
-    "requests>=2.28",
-    "websocket-client>=1.5",
+  "google-auth>=2.0",
+  "google-auth-oauthlib>=1.0",
+  "mcp[cli]>=1.6.0",
+  "requests>=2.28",
+  "websocket-client>=1.5",
 ]
 
 [project.urls]
@@ -32,12 +36,12 @@ Repository = "https://github.com/mio-github/mcp-colab-gpu"
 [project.scripts]
 mcp-colab-gpu = "mcp_colab_gpu.server:main"
 
+[project.entry-points.mcp]
+colab-gpu = "mcp_colab_gpu.server:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = [
-    "pytest>=9.0.2",
-    "pytest-asyncio>=0.24",
-]
+dev = ["pytest>=9.0.2", "pytest-asyncio>=0.24"]

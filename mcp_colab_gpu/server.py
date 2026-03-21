@@ -17,8 +17,10 @@ Extended: mcp-colab-gpu by Masaya Hirano --- all Colab Pro GPUs, high-memory, se
 """
 
 import asyncio
+import atexit
 import base64
 import json
+import logging
 import os
 import pathlib
 import re
@@ -28,7 +30,6 @@ import zipfile
 from mcp.server.fastmcp import FastMCP
 
 from .background import JobStatus, JobStore, run_background_job
-from .error_analysis import enrich_result
 from .colab_runtime import (
     allocate_runtime,
     create_session,
@@ -38,6 +39,9 @@ from .colab_runtime import (
     unassign_runtime,
     validate_params,
 )
+from .error_analysis import enrich_result
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("colab-gpu")
 
@@ -48,6 +52,27 @@ ARTIFACT_B64_END = "ARTIFACT_BASE64_END"
 
 _job_store = JobStore()
 _background_tasks: dict[str, asyncio.Task] = {}
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+
+
+def _shutdown() -> None:
+    """Cancel active background tasks on server shutdown."""
+    for job_id, task in list(_background_tasks.items()):
+        if not task.done():
+            task.cancel()
+            logger.info("Cancelled background task %s during shutdown", job_id)
+
+
+atexit.register(_shutdown)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _wrap_cells(code: str) -> tuple[str, int]:
@@ -76,7 +101,13 @@ def _parse_cell_output(stdout: str, num_cells: int) -> list[dict]:
         pattern = re.escape(start_marker) + r"\n?(.*?)\n?" + re.escape(end_marker)
         match = re.search(pattern, stdout, re.DOTALL)
         cell_stdout = match.group(1).strip() if match else ""
-        cells.append({"cell_num": i, "stdout": cell_stdout, "status": "ok" if match else "no_output"})
+        cells.append(
+            {
+                "cell_num": i,
+                "stdout": cell_stdout,
+                "status": "ok" if match else "no_output",
+            }
+        )
     return cells
 
 
@@ -96,12 +127,16 @@ def _strip_artifact_b64(stdout: str) -> str:
     pattern = (
         re.escape(ARTIFACT_B64_START)
         + r"\n.*?"
-        + r"(?:\n" + re.escape(ARTIFACT_B64_END) + r"|$)"
+        + r"(?:\n"
+        + re.escape(ARTIFACT_B64_END)
+        + r"|$)"
     )
     return re.sub(pattern, "", stdout, flags=re.DOTALL)
 
 
-def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int, float]:
+def _run_on_colab(
+    code: str, accelerator: str, high_memory: bool, timeout: int
+) -> tuple[str, str, int, float]:
     """Blocking function that allocates a runtime, executes code, and releases.
 
     This runs in a thread via asyncio.to_thread() for both sync and background paths.
@@ -119,8 +154,13 @@ def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) 
     try:
         kernel_id = create_session(assignment["proxy_url"], assignment["proxy_token"])
         stdout, stderr, exit_code = execute_code(
-            assignment["proxy_url"], assignment["proxy_token"], kernel_id, code,
-            timeout=timeout, access_token=access_token, endpoint=assignment["endpoint"],
+            assignment["proxy_url"],
+            assignment["proxy_token"],
+            kernel_id,
+            code,
+            timeout=timeout,
+            access_token=access_token,
+            endpoint=assignment["endpoint"],
         )
     finally:
         stop_event.set()
@@ -177,6 +217,11 @@ def _parse_drive_json(raw: str) -> dict[str, str]:
     return json.loads(raw)
 
 
+# ---------------------------------------------------------------------------
+# Tools — Code Execution
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 async def colab_execute(
     code: str,
@@ -189,8 +234,22 @@ async def colab_execute(
 ) -> str:
     """Execute Python code on a Google Colab GPU/TPU runtime.
 
-    Allocates a GPU or TPU, runs the code, and returns structured JSON
-    with per-cell output, errors, and stderr.
+    Primary tool for running GPU/TPU-accelerated Python code (ML training,
+    inference, CUDA operations). Allocates hardware, runs the code, and
+    returns structured JSON with per-cell output, errors, and stderr.
+
+    After execution:
+    - If background=True, poll with colab_poll(job_id) for results.
+    - If OOM error occurs, reduce batch_size or upgrade to A100/H100.
+    - If import error, add ``pip install <pkg>`` before your main code.
+    - To persist outputs to Google Drive, use the drive_save parameter.
+    - To pre-load data from Drive, use the drive_fetch parameter.
+
+    Common issues:
+    - QUOTA_EXCEEDED: Colab rate limit hit. Wait a few minutes or switch
+      to a different accelerator type.
+    - CUDA_ERROR: Driver mismatch or GPU init failure. Retry, or try T4.
+    - Only ONE background job can run at a time (Colab limitation).
 
     Args:
         code: Python code to execute on the Colab runtime.
@@ -205,7 +264,7 @@ async def colab_execute(
               "V5E1" - TPU v5e-1 (Colab Pro+)
               "V6E1" - TPU v6e-1 (Colab Pro+)
         high_memory: Enable high-memory runtime (more RAM). Default: False.
-        timeout: Max execution time in seconds. Default: 300.
+        timeout: Max execution time in seconds (10-3600). Default: 300.
         background: Run in background (non-blocking). Default: False.
             When True, returns immediately with a job_id that can be polled
             via colab_poll. Incompatible with drive_fetch/drive_save.
@@ -218,47 +277,85 @@ async def colab_execute(
             a freshly obtained token (safe for long-running tasks).
             Example: '{"/content/model.pt": "results/model.pt"}'
     """
-    fetch_map = _parse_drive_json(drive_fetch)
-    save_map = _parse_drive_json(drive_save)
-    if background:
+    try:
+        fetch_map = _parse_drive_json(drive_fetch)
+        save_map = _parse_drive_json(drive_save)
+        if background:
+            if fetch_map or save_map:
+                return json.dumps(
+                    {
+                        "error": "background=True is incompatible with drive_fetch/drive_save"
+                    }
+                )
+            job_id = await _job_store.create_if_no_active(accelerator)
+            if job_id is None:
+                active = await _job_store.active_job_id()
+                return json.dumps(
+                    {
+                        "error": "A background job is already running",
+                        "active_job_id": active,
+                    }
+                )
+            wrapped, num_cells = _wrap_cells(code)
+
+            def _format_bg_result(
+                stdout: str, stderr: str, rc: int, elapsed: float
+            ) -> str:
+                info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+                return _format_sync_result(
+                    stdout, stderr, rc, num_cells, session_info=info
+                )
+
+            task = asyncio.create_task(
+                run_background_job(
+                    _job_store,
+                    job_id,
+                    _run_on_colab,
+                    code=wrapped,
+                    accelerator=accelerator,
+                    high_memory=high_memory,
+                    timeout=timeout,
+                    format_result_fn=_format_bg_result,
+                )
+            )
+            _background_tasks[job_id] = task
+            task.add_done_callback(
+                lambda t, jid=job_id: _background_tasks.pop(jid, None)
+            )
+            return json.dumps({"job_id": job_id, "status": "starting"})
         if fetch_map or save_map:
-            return json.dumps({
-                "error": "background=True is incompatible with drive_fetch/drive_save"
-            })
-        job_id = await _job_store.create_if_no_active(accelerator)
-        if job_id is None:
-            active = await _job_store.active_job_id()
-            return json.dumps({
-                "error": "A background job is already running",
-                "active_job_id": active,
-            })
+            return await asyncio.to_thread(
+                _execute_with_drive,
+                code,
+                accelerator,
+                high_memory,
+                timeout,
+                fetch_map,
+                save_map,
+            )
         wrapped, num_cells = _wrap_cells(code)
-        def _format_bg_result(stdout: str, stderr: str, rc: int, elapsed: float) -> str:
-            info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
-            return _format_sync_result(stdout, stderr, rc, num_cells, session_info=info)
-        task = asyncio.create_task(run_background_job(
-            _job_store,
-            job_id,
+        stdout, stderr, rc, elapsed = await asyncio.to_thread(
             _run_on_colab,
-            code=wrapped,
-            accelerator=accelerator,
-            high_memory=high_memory,
-            timeout=timeout,
-            format_result_fn=_format_bg_result,
-        ))
-        _background_tasks[job_id] = task
-        task.add_done_callback(lambda t, jid=job_id: _background_tasks.pop(jid, None))
-        return json.dumps({"job_id": job_id, "status": "starting"})
-    if fetch_map or save_map:
-        return await asyncio.to_thread(
-            _execute_with_drive, code, accelerator, high_memory, timeout, fetch_map, save_map,
+            wrapped,
+            accelerator,
+            high_memory,
+            timeout,
         )
-    wrapped, num_cells = _wrap_cells(code)
-    stdout, stderr, rc, elapsed = await asyncio.to_thread(
-        _run_on_colab, wrapped, accelerator, high_memory, timeout,
-    )
-    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
-    return _format_sync_result(stdout, stderr, rc, num_cells, session_info=session_info)
+        session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+        return _format_sync_result(
+            stdout, stderr, rc, num_cells, session_info=session_info
+        )
+    except Exception as e:
+        logger.exception("colab_execute failed")
+        return json.dumps(
+            {
+                "cells": [],
+                "errors": [{"message": str(e)}],
+                "stderr": str(e),
+                "exit_code": 1,
+            },
+            indent=2,
+        )
 
 
 def _execute_with_drive(
@@ -302,20 +399,28 @@ def _execute_with_drive(
                     file_mappings.append({"file_id": fid, "dest_path": colab_path})
                 fetch_code = generate_drive_fetch_code(file_mappings, drive_creds.token)
                 _, fetch_stderr, fetch_rc = execute_code(
-                    assignment["proxy_url"], assignment["proxy_token"],
-                    kernel_id, fetch_code, timeout=120,
-                    access_token=access_token, endpoint=assignment["endpoint"],
+                    assignment["proxy_url"],
+                    assignment["proxy_token"],
+                    kernel_id,
+                    fetch_code,
+                    timeout=120,
+                    access_token=access_token,
+                    endpoint=assignment["endpoint"],
                 )
                 if fetch_rc != 0:
                     drive_errors.append({"drive_fetch_error": fetch_stderr.strip()})
-            except Exception as e:
+            except (OSError, ValueError, RuntimeError) as e:
                 drive_errors.append({"drive_fetch_error": str(e)})
         # --- Step 2: User code ---
         wrapped, num_cells = _wrap_cells(code)
         stdout, stderr, rc = execute_code(
-            assignment["proxy_url"], assignment["proxy_token"],
-            kernel_id, wrapped, timeout=timeout,
-            access_token=access_token, endpoint=assignment["endpoint"],
+            assignment["proxy_url"],
+            assignment["proxy_token"],
+            kernel_id,
+            wrapped,
+            timeout=timeout,
+            access_token=access_token,
+            endpoint=assignment["endpoint"],
         )
         cells = _parse_cell_output(stdout, num_cells)
         errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
@@ -329,16 +434,22 @@ def _execute_with_drive(
                     parts = drive_path.strip("/").split("/")
                     filename = parts[-1]
                     folder = "/".join(parts[:-1]) if len(parts) > 1 else ""
-                    save_mappings.append({
-                        "local_path": colab_path,
-                        "drive_folder": folder,
-                        "filename": filename,
-                    })
+                    save_mappings.append(
+                        {
+                            "local_path": colab_path,
+                            "drive_folder": folder,
+                            "filename": filename,
+                        }
+                    )
                 save_code = generate_drive_save_code(save_mappings, drive_creds.token)
                 _save_stdout, save_stderr, save_rc = execute_code(
-                    assignment["proxy_url"], assignment["proxy_token"],
-                    kernel_id, save_code, timeout=300,
-                    access_token=access_token, endpoint=assignment["endpoint"],
+                    assignment["proxy_url"],
+                    assignment["proxy_token"],
+                    kernel_id,
+                    save_code,
+                    timeout=300,
+                    access_token=access_token,
+                    endpoint=assignment["endpoint"],
                 )
                 if save_rc != 0:
                     drive_errors.append({"drive_save_error": save_stderr.strip()})
@@ -347,7 +458,7 @@ def _execute_with_drive(
                         {"colab_path": m["local_path"], "drive_path": dp}
                         for m, dp in zip(save_mappings, save_map.values())
                     ]
-            except Exception as e:
+            except (OSError, ValueError, RuntimeError) as e:
                 drive_errors.append({"drive_save_error": str(e)})
     finally:
         stop_event.set()
@@ -355,94 +466,16 @@ def _execute_with_drive(
     elapsed = round(time.monotonic() - start_time, 2)
     session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
     result: dict = {
-        "cells": cells, "errors": errors + drive_errors,
-        "stderr": stderr, "exit_code": rc,
+        "cells": cells,
+        "errors": errors + drive_errors,
+        "stderr": stderr,
+        "exit_code": rc,
         "session_info": session_info,
     }
     if drive_saved:
         result["drive_saved"] = drive_saved
     result = enrich_result(result, stderr, rc)
     return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
-async def colab_cancel(job_id: str) -> str:
-    """Cancel an active background job.
-
-    Marks the job as cancelled and attempts to cancel the underlying
-    asyncio task. Use colab_jobs to find the job_id.
-
-    Args:
-        job_id: The job identifier returned by colab_execute.
-    """
-    cancelled = await _job_store.cancel(job_id)
-    if not cancelled:
-        record = await _job_store.get(job_id)
-        if record is None:
-            return json.dumps({"error": f"Unknown job_id: {job_id}"})
-        return json.dumps({
-            "error": f"Cannot cancel job in '{record.status.value}' state",
-            "job_id": job_id,
-            "status": record.status.value,
-        })
-    # Cancel the asyncio task if it is still running.
-    bg_task = _background_tasks.pop(job_id, None)
-    if bg_task is not None and not bg_task.done():
-        bg_task.cancel()
-    return json.dumps({"job_id": job_id, "status": "cancelled"})
-
-
-@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-async def colab_poll(job_id: str) -> str:
-    """Poll a background job for its current status and results.
-
-    Use this after launching a background execution with
-    colab_execute(..., background=True) to check progress
-    and retrieve results when complete.
-
-    Args:
-        job_id: The job identifier returned by colab_execute.
-    """
-    record = await _job_store.get(job_id)
-    if record is None:
-        return json.dumps({"error": f"Unknown job_id: {job_id}"})
-    info: dict = {
-        "job_id": record.job_id,
-        "status": record.status.value,
-        "accelerator": record.accelerator,
-        "created_at": record.created_at,
-    }
-    if record.completed_at is not None:
-        info["completed_at"] = record.completed_at
-    if record.status == JobStatus.COMPLETED and record.result is not None:
-        info["result"] = json.loads(record.result)
-    if record.status == JobStatus.FAILED and record.error is not None:
-        info["error"] = record.error
-    if record.status == JobStatus.CANCELLED and record.error is not None:
-        info["error"] = record.error
-    return json.dumps(info, indent=2)
-
-
-@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-async def colab_jobs() -> str:
-    """List all tracked background jobs.
-
-    Returns a JSON array of job summaries including job_id, status,
-    accelerator type, and timestamps.
-    """
-    records = await _job_store.list_all()
-    jobs = []
-    for record in records:
-        entry: dict = {
-            "job_id": record.job_id,
-            "status": record.status.value,
-            "accelerator": record.accelerator,
-            "created_at": record.created_at,
-        }
-        if record.completed_at is not None:
-            entry["completed_at"] = record.completed_at
-        jobs.append(entry)
-    return json.dumps({"jobs": jobs, "count": len(jobs)}, indent=2)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -454,8 +487,18 @@ async def colab_execute_file(
 ) -> str:
     """Execute a local Python file on a Google Colab GPU/TPU runtime.
 
-    Reads the file contents and sends them for execution on a Colab runtime.
-    Only .py files are allowed for security.
+    Reads the file contents and sends them for execution on a Colab
+    runtime. Use this instead of colab_execute when you already have
+    a .py script file ready to run.
+
+    After execution:
+    - Check exit_code and cell outputs in the response.
+    - If you need to collect output files (models, images), use
+      colab_execute_notebook instead.
+
+    Common issues:
+    - Only .py files are accepted (security restriction).
+    - File must exist at the given path on the local machine.
 
     Args:
         file_path: Path to a local .py file to execute on Colab.
@@ -470,19 +513,37 @@ async def colab_execute_file(
               "V5E1" - TPU v5e-1 (Colab Pro+)
               "V6E1" - TPU v6e-1 (Colab Pro+)
         high_memory: Enable high-memory runtime (more RAM). Default: False.
-        timeout: Max execution time in seconds. Default: 300.
+        timeout: Max execution time in seconds (10-3600). Default: 300.
     """
     try:
-        resolved = _validate_file_path(file_path)
-    except (ValueError, FileNotFoundError) as e:
-        return json.dumps({"error": str(e)})
-    code = resolved.read_text()
-    wrapped, num_cells = _wrap_cells(code)
-    stdout, stderr, rc, elapsed = await asyncio.to_thread(
-        _run_on_colab, wrapped, accelerator, high_memory, timeout,
-    )
-    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
-    return _format_sync_result(stdout, stderr, rc, num_cells, session_info=session_info)
+        try:
+            resolved = _validate_file_path(file_path)
+        except (ValueError, FileNotFoundError) as e:
+            return json.dumps({"error": str(e)})
+        code = resolved.read_text()
+        wrapped, num_cells = _wrap_cells(code)
+        stdout, stderr, rc, elapsed = await asyncio.to_thread(
+            _run_on_colab,
+            wrapped,
+            accelerator,
+            high_memory,
+            timeout,
+        )
+        session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+        return _format_sync_result(
+            stdout, stderr, rc, num_cells, session_info=session_info
+        )
+    except Exception as e:
+        logger.exception("colab_execute_file failed")
+        return json.dumps(
+            {
+                "cells": [],
+                "errors": [{"message": str(e)}],
+                "stderr": str(e),
+                "exit_code": 1,
+            },
+            indent=2,
+        )
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -496,7 +557,18 @@ async def colab_execute_notebook(
     """Execute Python code on Colab GPU/TPU and collect generated artifacts.
 
     Runs the code, then scans the runtime for output files (images, CSVs,
-    models, etc.), zips them, and downloads to a local directory.
+    models, etc.), zips them, and downloads to a local directory. Use this
+    when your code produces files you need to retrieve locally.
+
+    After execution:
+    - Check artifact_files in the response for collected output filenames.
+    - Files are extracted to the specified output_dir.
+    - For files larger than 50 MB, use colab_execute with drive_save instead.
+
+    Common issues:
+    - No artifacts collected: ensure your code writes files to /tmp,
+      /content, or the current working directory.
+    - Each artifact file must be under 50 MB (base64 transfer limit).
 
     Args:
         code: Python code to execute on the Colab runtime.
@@ -512,11 +584,12 @@ async def colab_execute_notebook(
               "V5E1" - TPU v5e-1 (Colab Pro+)
               "V6E1" - TPU v6e-1 (Colab Pro+)
         high_memory: Enable high-memory runtime (more RAM). Default: False.
-        timeout: Max execution time in seconds. Default: 300.
+        timeout: Max execution time in seconds (10-3600). Default: 300.
     """
-    output_dir = os.path.expanduser(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    artifact_code = '''
+    try:
+        output_dir = os.path.expanduser(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        artifact_code = """
 
 # --- colab-exec artifact collection ---
 import os, zipfile, base64, glob
@@ -558,38 +631,193 @@ if _collected:
     print(f"[colab-gpu] Collected {len(_collected)} artifact(s)", flush=True)
 else:
     print("[colab-gpu] No artifacts found to collect", flush=True)
-'''
-    full_code = code + "\n\n" + artifact_code
-    wrapped, num_cells = _wrap_cells(full_code)
-    stdout, stderr, rc, elapsed = await asyncio.to_thread(
-        _run_on_colab, wrapped, accelerator, high_memory, timeout,
-    )
-    session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
-    # Extract artifact base64 before stripping it from stdout.
-    b64_data = _extract_artifact_b64(stdout)
-    # Strip the base64 block so it does not leak into cell output JSON,
-    # which would pollute the AI client's context window.
-    clean_stdout = _strip_artifact_b64(stdout)
-    cells = _parse_cell_output(clean_stdout, num_cells)
-    errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
-    artifact_files = []
-    artifacts_zip_path = None
-    if b64_data:
-        try:
-            zip_bytes = base64.b64decode(b64_data)
-            artifacts_zip_path = os.path.join(output_dir, "colab_artifacts.zip")
-            with open(artifacts_zip_path, "wb") as f:
-                f.write(zip_bytes)
-            artifact_files = _safe_extract_zip(artifacts_zip_path, output_dir)
-        except Exception as e:
-            errors.append({"artifact_error": str(e)})
-    result: dict = {
-        "cells": cells, "errors": errors, "artifacts_zip": artifacts_zip_path,
-        "artifact_files": artifact_files, "stderr": stderr, "exit_code": rc,
-        "session_info": session_info,
-    }
-    result = enrich_result(result, stderr, rc)
-    return json.dumps(result, indent=2)
+"""
+        full_code = code + "\n\n" + artifact_code
+        wrapped, num_cells = _wrap_cells(full_code)
+        stdout, stderr, rc, elapsed = await asyncio.to_thread(
+            _run_on_colab,
+            wrapped,
+            accelerator,
+            high_memory,
+            timeout,
+        )
+        session_info = {"elapsed_seconds": elapsed, "accelerator": accelerator}
+        # Extract artifact base64 before stripping it from stdout.
+        b64_data = _extract_artifact_b64(stdout)
+        # Strip the base64 block so it does not leak into cell output JSON,
+        # which would pollute the AI client's context window.
+        clean_stdout = _strip_artifact_b64(stdout)
+        cells = _parse_cell_output(clean_stdout, num_cells)
+        errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
+        artifact_files = []
+        artifacts_zip_path = None
+        if b64_data:
+            try:
+                zip_bytes = base64.b64decode(b64_data)
+                artifacts_zip_path = os.path.join(output_dir, "colab_artifacts.zip")
+                await asyncio.to_thread(
+                    pathlib.Path(artifacts_zip_path).write_bytes, zip_bytes
+                )
+                artifact_files = await asyncio.to_thread(
+                    _safe_extract_zip, artifacts_zip_path, output_dir
+                )
+            except (OSError, ValueError, zipfile.BadZipFile) as e:
+                errors.append({"artifact_error": str(e)})
+        result: dict = {
+            "cells": cells,
+            "errors": errors,
+            "artifacts_zip": artifacts_zip_path,
+            "artifact_files": artifact_files,
+            "stderr": stderr,
+            "exit_code": rc,
+            "session_info": session_info,
+        }
+        result = enrich_result(result, stderr, rc)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.exception("colab_execute_notebook failed")
+        return json.dumps(
+            {
+                "cells": [],
+                "errors": [{"message": str(e)}],
+                "artifacts_zip": None,
+                "artifact_files": [],
+                "stderr": str(e),
+                "exit_code": 1,
+            },
+            indent=2,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tools — Background Job Management
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def colab_cancel(job_id: str) -> str:
+    """Cancel an active background job.
+
+    Marks the job as cancelled and attempts to cancel the underlying
+    asyncio task. Use colab_jobs to find active job IDs.
+
+    After cancellation:
+    - Verify with colab_poll(job_id) that the status is 'cancelled'.
+    - The Colab runtime is released automatically.
+    - You can then start a new background job with colab_execute.
+
+    Common issues:
+    - Cannot cancel a job that is already completed, failed, or cancelled.
+    - Use colab_jobs first if you don't have the job_id.
+
+    Args:
+        job_id: The job identifier returned by colab_execute.
+    """
+    try:
+        cancelled = await _job_store.cancel(job_id)
+        if not cancelled:
+            record = await _job_store.get(job_id)
+            if record is None:
+                return json.dumps({"error": f"Unknown job_id: {job_id}"})
+            return json.dumps(
+                {
+                    "error": f"Cannot cancel job in '{record.status.value}' state",
+                    "job_id": job_id,
+                    "status": record.status.value,
+                }
+            )
+        # Cancel the asyncio task if it is still running.
+        bg_task = _background_tasks.pop(job_id, None)
+        if bg_task is not None and not bg_task.done():
+            bg_task.cancel()
+        return json.dumps({"job_id": job_id, "status": "cancelled"})
+    except Exception as e:
+        logger.exception("colab_cancel failed")
+        return json.dumps({"error": f"Cancel failed: {e}"})
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def colab_poll(job_id: str) -> str:
+    """Poll a background job for its current status and results.
+
+    Use this after launching a background execution with
+    colab_execute(..., background=True) to check progress and
+    retrieve results when complete.
+
+    Interpreting the response:
+    - status='starting' or 'running': job is in progress, poll again later.
+    - status='completed': result field contains the execution output.
+    - status='failed': error field describes what went wrong.
+    - status='cancelled': job was stopped via colab_cancel.
+
+    Common issues:
+    - Unknown job_id: use colab_jobs to list all tracked jobs.
+    - Jobs are cleaned up automatically after 5 minutes.
+
+    Args:
+        job_id: The job identifier returned by colab_execute.
+    """
+    try:
+        record = await _job_store.get(job_id)
+        if record is None:
+            return json.dumps({"error": f"Unknown job_id: {job_id}"})
+        info: dict = {
+            "job_id": record.job_id,
+            "status": record.status.value,
+            "accelerator": record.accelerator,
+            "created_at": record.created_at,
+        }
+        if record.completed_at is not None:
+            info["completed_at"] = record.completed_at
+        if record.status == JobStatus.COMPLETED and record.result is not None:
+            info["result"] = json.loads(record.result)
+        if record.status == JobStatus.FAILED and record.error is not None:
+            info["error"] = record.error
+        if record.status == JobStatus.CANCELLED and record.error is not None:
+            info["error"] = record.error
+        return json.dumps(info, indent=2)
+    except Exception as e:
+        logger.exception("colab_poll failed")
+        return json.dumps({"error": f"Poll failed: {e}"})
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def colab_jobs() -> str:
+    """List all tracked background jobs.
+
+    Returns a JSON array of job summaries including job_id, status,
+    accelerator type, and timestamps. Use this to find job IDs for
+    colab_poll or colab_cancel.
+
+    After listing:
+    - Use colab_poll(job_id) on any job to get detailed results.
+    - Use colab_cancel(job_id) to stop an active job.
+    - Completed/failed/cancelled jobs are auto-cleaned after 5 minutes.
+    """
+    try:
+        records = await _job_store.list_all()
+        jobs = []
+        for record in records:
+            entry: dict = {
+                "job_id": record.job_id,
+                "status": record.status.value,
+                "accelerator": record.accelerator,
+                "created_at": record.created_at,
+            }
+            if record.completed_at is not None:
+                entry["completed_at"] = record.completed_at
+            jobs.append(entry)
+        return json.dumps({"jobs": jobs, "count": len(jobs)}, indent=2)
+    except Exception as e:
+        logger.exception("colab_jobs failed")
+        return json.dumps(
+            {"error": f"Failed to list jobs: {e}", "jobs": [], "count": 0}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tools — Google Drive Integration
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -599,10 +827,18 @@ async def colab_drive_upload(
 ) -> str:
     """Upload a local file to Google Drive.
 
-    The file will be accessible from Colab via Drive mount:
-      from google.colab import drive
-      drive.mount('/content/drive')
-      # Access at /content/drive/MyDrive/<drive_folder>/<filename>
+    Use this to stage input data before running colab_execute with
+    the drive_fetch parameter. The file is uploaded to the specified
+    folder under MyDrive.
+
+    After upload:
+    - Pass the drive path in colab_execute's drive_fetch parameter
+      to make the file available on the Colab runtime.
+    - Example: colab_execute(code="...", drive_fetch='{"colab_data/train.csv": "/content/train.csv"}')
+
+    Common issues:
+    - First use requires Google Drive OAuth authorization (browser popup).
+    - Nested folders (e.g. 'data/train') are created automatically.
 
     Args:
         local_path: Path to the local file to upload.
@@ -615,17 +851,25 @@ async def colab_drive_upload(
 
     try:
         creds = get_drive_credentials()
-        result = await asyncio.to_thread(upload_to_drive, local_path, drive_folder, creds)
-        return json.dumps({
-            "status": "uploaded",
-            "drive_file_id": result["id"],
-            "filename": result["name"],
-            "drive_folder": drive_folder,
-            "colab_path": f"/content/drive/MyDrive/{drive_folder}/{result['name']}" if drive_folder else f"/content/drive/MyDrive/{result['name']}",
-        }, indent=2)
+        result = await asyncio.to_thread(
+            upload_to_drive, local_path, drive_folder, creds
+        )
+        return json.dumps(
+            {
+                "status": "uploaded",
+                "drive_file_id": result["id"],
+                "filename": result["name"],
+                "drive_folder": drive_folder,
+                "colab_path": f"/content/drive/MyDrive/{drive_folder}/{result['name']}"
+                if drive_folder
+                else f"/content/drive/MyDrive/{result['name']}",
+            },
+            indent=2,
+        )
     except FileNotFoundError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
+        logger.exception("colab_drive_upload failed")
         return json.dumps({"error": f"Drive upload failed: {e}"})
 
 
@@ -636,34 +880,49 @@ async def colab_drive_download(
 ) -> str:
     """Download a file from Google Drive to a local path.
 
-    Use this to retrieve results saved to Drive by Colab execution:
-      colab_execute(code=\"\"\"
-        import torch
-        torch.save(model, '/content/drive/MyDrive/results/model.pt')
-      \"\"\")
-      colab_drive_download(drive_path='results/model.pt', local_path='./model.pt')
+    Use this to retrieve results saved to Drive by colab_execute with
+    the drive_save parameter, or any file stored on Google Drive.
+
+    After download:
+    - The file is saved at the specified local_path.
+    - Process or inspect the file locally as needed.
+
+    Common issues:
+    - File not found: verify the drive_path matches the Drive folder
+      structure (relative to MyDrive root).
+    - First use requires Google Drive OAuth authorization.
 
     Args:
         drive_path: File path on Google Drive relative to MyDrive
             (e.g. 'results/model.pt' or 'colab_data/output.csv').
         local_path: Local destination path where the file will be saved.
     """
-    from .drive import get_drive_credentials, download_from_drive
+    from .drive import download_from_drive, get_drive_credentials
 
     try:
         creds = get_drive_credentials()
-        result = await asyncio.to_thread(download_from_drive, drive_path, local_path, creds)
-        return json.dumps({
-            "status": "downloaded",
-            "local_path": result["local_path"],
-            "drive_file_id": result["drive_file_id"],
-            "size_bytes": result["size"],
-        }, indent=2)
+        result = await asyncio.to_thread(
+            download_from_drive, drive_path, local_path, creds
+        )
+        return json.dumps(
+            {
+                "status": "downloaded",
+                "local_path": result["local_path"],
+                "drive_file_id": result["drive_file_id"],
+                "size_bytes": result["size"],
+            },
+            indent=2,
+        )
     except FileNotFoundError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
+        logger.exception("colab_drive_download failed")
         return json.dumps({"error": f"Drive download failed: {e}"})
 
+
+# ---------------------------------------------------------------------------
+# Tools — Status & Info
+# ---------------------------------------------------------------------------
 
 _ACCELERATOR_INFO: dict[str, dict[str, str]] = {
     "T4": {"vram": "16 GB", "tier": "free"},
@@ -680,47 +939,74 @@ _ACCELERATOR_INFO: dict[str, dict[str, str]] = {
 async def colab_status() -> str:
     """Return current server status including accelerator info and job state.
 
-    Provides supported accelerator types with their specifications,
-    the currently active background job (if any), and recent executions.
+    Use this before executing code to check which accelerators are
+    available and whether a background job is already running (only
+    one background job is allowed at a time).
+
+    After checking status:
+    - Choose an accelerator from supported_accelerators for colab_execute.
+    - If active_job is present, wait for it or cancel with colab_cancel
+      before starting a new background job.
     """
-    active_id = await _job_store.active_job_id()
-    active_job = None
-    if active_id is not None:
-        record = await _job_store.get(active_id)
-        if record is not None:
-            active_job = {
-                "job_id": record.job_id,
-                "status": record.status.value,
-                "accelerator": record.accelerator,
-                "created_at": record.created_at,
+    try:
+        active_id = await _job_store.active_job_id()
+        active_job = None
+        if active_id is not None:
+            record = await _job_store.get(active_id)
+            if record is not None:
+                active_job = {
+                    "job_id": record.job_id,
+                    "status": record.status.value,
+                    "accelerator": record.accelerator,
+                    "created_at": record.created_at,
+                }
+        all_records = await _job_store.list_all()
+        terminal = [
+            r
+            for r in all_records
+            if r.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+        ]
+        terminal.sort(key=lambda r: r.completed_at or "", reverse=True)
+        recent = [
+            {
+                "job_id": r.job_id,
+                "status": r.status.value,
+                "accelerator": r.accelerator,
+                "completed_at": r.completed_at,
             }
-    all_records = await _job_store.list_all()
-    terminal = [
-        r for r in all_records
-        if r.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
-    ]
-    terminal.sort(key=lambda r: r.completed_at or "", reverse=True)
-    recent = [
-        {
-            "job_id": r.job_id,
-            "status": r.status.value,
-            "accelerator": r.accelerator,
-            "completed_at": r.completed_at,
-        }
-        for r in terminal[:5]
-    ]
-    return json.dumps({
-        "supported_accelerators": _ACCELERATOR_INFO,
-        "active_job": active_job,
-        "recent_executions": recent,
-    }, indent=2)
+            for r in terminal[:5]
+        ]
+        return json.dumps(
+            {
+                "supported_accelerators": _ACCELERATOR_INFO,
+                "active_job": active_job,
+                "recent_executions": recent,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        logger.exception("colab_status failed")
+        return json.dumps({"error": f"Status check failed: {e}"})
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
 async def colab_version() -> str:
-    """Return the mcp-colab-gpu server version."""
-    from . import __version__
-    return json.dumps({"version": __version__})
+    """Return the mcp-colab-gpu server version.
+
+    Use this to verify server compatibility or for debugging.
+    """
+    try:
+        from . import __version__
+
+        return json.dumps({"version": __version__})
+    except Exception as e:
+        logger.exception("colab_version failed")
+        return json.dumps({"error": f"Version check failed: {e}"})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main():

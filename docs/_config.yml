@@ -1,0 +1,4 @@
+---
+theme: jekyll-theme-minimal
+title: mcp-colab-gpu
+description: MCP server for executing Python on Google Colab GPU/TPU runtimes
