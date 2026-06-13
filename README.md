@@ -395,6 +395,33 @@ This fork includes the following security hardening over the original:
 - **Input validation**: The `accelerator` parameter is validated against the known set of supported accelerators, and `timeout` is bounded to 10--3600 seconds, before any network calls are made.
 - **Token refresh error logging**: When automatic token refresh fails, the error is logged to stderr with a warning message before falling back to re-authentication, instead of silently discarding the error.
 
+## MED Fork — Additional Changes
+
+This fork (`arnatoatadaink/mcp-colab-auth-hardening`) adds further refresh-token
+isolation and reliability fixes on top of the security improvements above:
+
+- **Refresh-token isolation (`MCP_COLAB_AUTH_MODE`)**: Controls how the Colab
+  and Drive refresh tokens are handled, limiting the blast radius of a leaked
+  `token.json` / `drive_token.json`.
+  - `hybrid` (default) -- `access_type="offline"`, but the refresh token is
+    kept only in process memory. The on-disk token file always has
+    `refresh_token: null`, so a leaked file expires with the ~1h access token.
+    A process restart requires one browser re-consent.
+  - `online` -- `access_type="online"`. Google never issues a refresh token,
+    so `refresh_token: null` occurs naturally. Re-consent is required every
+    ~1h with no long-running-session support.
+- **`COLAB_API_BASE` override**: Points the Colab API base URL at a local mock
+  server (e.g. `http://localhost:8002`) for integration testing without
+  consuming real Colab quota.
+- **`/tun/m/assign` retry on transient errors**: Allocating a fresh runtime can
+  occasionally return `503` after ~50s before a retry succeeds in a few
+  seconds. The allocation POST now uses a 60s timeout and retries up to 3
+  times (5s delay) on `429/500/502/503/504` or read timeout, raising
+  immediately on non-retryable errors (e.g. `401`).
+
+Verified end-to-end against a real Colab T4 runtime: OAuth (hybrid mode) ->
+runtime allocation -> kernel session -> code execution -> runtime release.
+
 ## Troubleshooting
 
 **"GPU quota exceeded"** -- Colab has usage limits. Wait and retry, or use a different Google account.
