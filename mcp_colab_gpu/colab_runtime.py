@@ -24,7 +24,22 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
-COLAB_API = "https://colab.research.google.com"
+COLAB_API = os.environ.get("COLAB_API_BASE", "https://colab.research.google.com")
+
+# Auth hardening mode (MCP-COLAB-HARDEN). Two strategies for limiting the
+# blast radius of a leaked token.json:
+#   "hybrid" (default) -- access_type="offline", but the refresh token is
+#       kept only in process memory; the on-disk copy always has
+#       refresh_token=null. No re-consent needed while the process runs;
+#       a restart requires one browser re-consent.
+#   "online" -- access_type="online". Google never issues a refresh
+#       token, so token.json naturally has refresh_token=null. The
+#       access token expires in ~1h, after which the browser consent
+#       flow re-runs automatically (no long-running session support).
+AUTH_MODE = os.environ.get("MCP_COLAB_AUTH_MODE", "hybrid")
+if AUTH_MODE not in ("hybrid", "online"):
+    raise ValueError(f"Invalid MCP_COLAB_AUTH_MODE: {AUTH_MODE!r} (must be 'hybrid' or 'online')")
+
 SCOPES = [
     "https://www.googleapis.com/auth/colaboratory",
     "profile",
@@ -46,11 +61,25 @@ CLIENT_CONFIG = {
 TOKEN_CACHE_DIR = os.path.expanduser("~/.config/colab-exec")
 TOKEN_CACHE_PATH = os.path.join(TOKEN_CACHE_DIR, "token.json")
 
+# In-memory cache of the refresh token (this process's lifetime only).
+# The on-disk copy always has refresh_token=null (see _save_credentials),
+# so a leaked token.json cannot mint new access tokens; a restarted
+# process must re-consent once via the browser. (MCP-COLAB-HARDEN)
+_cached_refresh_token: str | None = None
+
 HIGHMEM_REQUIRED_ACCELERATORS = {"V5E1", "V6E1"}
 VALID_ACCELERATORS = {"T4", "L4", "A100", "H100", "G4", "V5E1", "V6E1"}
 MAX_TIMEOUT = 3600
 MIN_TIMEOUT = 10
 EPHEMERAL_AUTH_TYPES = {"dfs_ephemeral", "auth_user_ephemeral"}
+
+# /tun/m/assign POST can transiently 503 while Colab provisions a new
+# runtime, and a successful response can take longer than a typical
+# request (observed: 503 after ~56s, success after ~4s on retry).
+ASSIGN_POST_TIMEOUT = 60
+ASSIGN_MAX_ATTEMPTS = 3
+ASSIGN_RETRY_DELAY = 5
+ASSIGN_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 def validate_params(accelerator: str, timeout: int) -> None:
@@ -67,11 +96,20 @@ def validate_params(accelerator: str, timeout: int) -> None:
 
 
 def get_credentials() -> Credentials:
-    """Load cached credentials or run the browser OAuth2 flow."""
+    """Load cached credentials or run the browser OAuth2 flow.
+
+    access_type="offline" is kept so Google issues a refresh token, but
+    that refresh token is only ever held in _cached_refresh_token
+    (process memory) -- see _save_credentials.
+    """
+    global _cached_refresh_token  # noqa: PLW0603
+
     creds = None
 
     if os.path.exists(TOKEN_CACHE_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_CACHE_PATH, SCOPES)
+        if not creds.refresh_token and _cached_refresh_token:
+            creds._refresh_token = _cached_refresh_token
 
     if creds and creds.expired and creds.refresh_token:
         try:
@@ -83,22 +121,34 @@ def get_credentials() -> Credentials:
 
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
+        access_type = "online" if AUTH_MODE == "online" else "offline"
         creds = flow.run_local_server(
             port=0,
-            access_type="offline",
+            access_type=access_type,
             prompt="consent",
             success_message="Authentication successful! You can close this tab.",
         )
         _save_credentials(creds)
 
+    if creds.refresh_token:
+        _cached_refresh_token = creds.refresh_token
+
     return creds
 
 
 def _save_credentials(creds: Credentials):
+    """Persist credentials with the refresh token stripped.
+
+    The refresh token is kept only in _cached_refresh_token (memory);
+    token.json always has refresh_token=null so it expires with the
+    access token (~1h) even if the file leaks. (MCP-COLAB-HARDEN)
+    """
     os.makedirs(TOKEN_CACHE_DIR, exist_ok=True)
+    info = json.loads(creds.to_json())
+    info["refresh_token"] = None
     fd = os.open(TOKEN_CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(creds.to_json())
+        f.write(json.dumps(info))
 
 
 def _strip_xssi(text: str) -> dict:
@@ -185,13 +235,33 @@ def allocate_runtime(
         raise RuntimeError("No XSRF token in Colab assign response")
 
     post_headers = _colab_headers(token, {"X-Goog-Colab-Token": xsrf_token})
-    r = requests.post(
-        f"{COLAB_API}/tun/m/assign",
-        params=params,
-        headers=post_headers,
-        timeout=30,
-    )
-    r.raise_for_status()
+    last_error = None
+    for attempt in range(1, ASSIGN_MAX_ATTEMPTS + 1):
+        try:
+            r = requests.post(
+                f"{COLAB_API}/tun/m/assign",
+                params=params,
+                headers=post_headers,
+                timeout=ASSIGN_POST_TIMEOUT,
+            )
+            r.raise_for_status()
+            break
+        except requests.exceptions.ReadTimeout as e:
+            last_error = e
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status not in ASSIGN_RETRYABLE_STATUS:
+                raise
+            last_error = e
+        if attempt < ASSIGN_MAX_ATTEMPTS:
+            print(
+                f"[colab-gpu] assign POST attempt {attempt} failed ({last_error}); "
+                f"retrying in {ASSIGN_RETRY_DELAY}s...",
+                file=sys.stderr,
+            )
+            time.sleep(ASSIGN_RETRY_DELAY)
+        else:
+            raise last_error
     assignment = _strip_xssi(r.text)
 
     parsed = _parse_assignment(assignment)

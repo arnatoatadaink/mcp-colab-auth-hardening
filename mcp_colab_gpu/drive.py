@@ -17,7 +17,7 @@ from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .colab_runtime import TOKEN_CACHE_DIR
+from .colab_runtime import AUTH_MODE, TOKEN_CACHE_DIR
 
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
@@ -58,6 +58,12 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 # Track when the Drive token was last obtained/refreshed (epoch seconds).
 _last_drive_token_time: float = 0.0
 
+# In-memory cache of the Drive refresh token (this process's lifetime
+# only). The on-disk copy always has refresh_token=null (see
+# _save_drive_credentials), so a leaked drive_token.json cannot mint
+# new access tokens. (MCP-COLAB-HARDEN)
+_cached_drive_refresh_token: str | None = None
+
 
 def _drive_query_escape(value: str) -> str:
     """Escape a value for use in a Google Drive API query string."""
@@ -77,7 +83,7 @@ def get_drive_credentials() -> Credentials:
     even when the underlying ``Credentials`` object still reports itself
     as valid.  This is used for E2E testing with a short TTL (e.g. 60 s).
     """
-    global _last_drive_token_time  # noqa: PLW0603
+    global _last_drive_token_time, _cached_drive_refresh_token  # noqa: PLW0603
 
     max_age_env = os.environ.get("MCP_DRIVE_TOKEN_MAX_AGE")
     max_token_age: int | None = int(max_age_env) if max_age_env else None
@@ -86,6 +92,8 @@ def get_drive_credentials() -> Credentials:
 
     if os.path.exists(DRIVE_TOKEN_CACHE_PATH):
         creds = Credentials.from_authorized_user_file(DRIVE_TOKEN_CACHE_PATH, DRIVE_SCOPES)
+        if not creds.refresh_token and _cached_drive_refresh_token:
+            creds._refresh_token = _cached_drive_refresh_token
 
     # Force refresh if the token is older than max_token_age.
     if (
@@ -103,6 +111,7 @@ def get_drive_credentials() -> Credentials:
         if creds.refresh_token:
             try:
                 creds.refresh(GoogleRequest())
+                _cached_drive_refresh_token = creds.refresh_token
                 _save_drive_credentials(creds)
                 _last_drive_token_time = time.time()
                 return creds
@@ -133,9 +142,16 @@ def get_drive_credentials() -> Credentials:
             flow = InstalledAppFlow.from_client_config(
                 DRIVE_CLIENT_CONFIG, DRIVE_SCOPES,
             )
+        # AUTH_MODE="hybrid" (default): access_type="offline" is kept so
+        # Google issues a refresh token, but that refresh token is only
+        # ever held in _cached_drive_refresh_token (process memory) --
+        # see _save_drive_credentials. AUTH_MODE="online": no refresh
+        # token is issued at all; re-consent is required after the
+        # access token expires (~1h). (MCP-COLAB-HARDEN)
+        access_type = "online" if AUTH_MODE == "online" else "offline"
         creds = flow.run_local_server(
             port=0,
-            access_type="offline",
+            access_type=access_type,
             prompt="consent",
             success_message="Drive authentication successful! You can close this tab.",
         )
@@ -146,14 +162,26 @@ def get_drive_credentials() -> Credentials:
     if _last_drive_token_time == 0.0:
         _last_drive_token_time = time.time()
 
+    if creds.refresh_token:
+        _cached_drive_refresh_token = creds.refresh_token
+
     return creds
 
 
 def _save_drive_credentials(creds: Credentials) -> None:
+    """Persist Drive credentials with the refresh token stripped.
+
+    The refresh token is kept only in _cached_drive_refresh_token
+    (memory); drive_token.json always has refresh_token=null so it
+    expires with the access token (~1h) even if the file leaks.
+    (MCP-COLAB-HARDEN)
+    """
     os.makedirs(TOKEN_CACHE_DIR, exist_ok=True)
+    info = json.loads(creds.to_json())
+    info["refresh_token"] = None
     fd = os.open(DRIVE_TOKEN_CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(creds.to_json())
+        f.write(json.dumps(info))
 
 
 def _drive_headers(creds: Credentials) -> dict:

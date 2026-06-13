@@ -338,3 +338,145 @@ class TestTokenMaxAge:
 
         creds.refresh.assert_not_called()
         assert result is creds
+
+
+class TestRefreshTokenHardening:
+    """MCP-COLAB-HARDEN: refresh_token must never be written to disk."""
+
+    def test_save_strips_refresh_token_from_disk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(drive_mod, "TOKEN_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(drive_mod, "DRIVE_TOKEN_CACHE_PATH", str(tmp_path / "drive_token.json"))
+
+        creds = MagicMock()
+        creds.to_json.return_value = json.dumps({
+            "token": "access-tok",
+            "refresh_token": "real-refresh-tok",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "scopes": drive_mod.DRIVE_SCOPES,
+        })
+
+        drive_mod._save_drive_credentials(creds)
+
+        with open(tmp_path / "drive_token.json") as f:
+            saved = json.load(f)
+
+        assert saved["refresh_token"] is None
+        assert saved["token"] == "access-tok"
+
+    def test_cached_refresh_token_injected_when_disk_copy_lacks_one(self, monkeypatch):
+        """drive_token.json with refresh_token=null still allows a silent
+        refresh within the same process via _cached_drive_refresh_token."""
+        from datetime import datetime, timedelta, timezone
+
+        from google.oauth2.credentials import Credentials
+
+        monkeypatch.setattr(drive_mod, "_cached_drive_refresh_token", "cached-refresh-tok")
+        monkeypatch.setattr(drive_mod, "_last_drive_token_time", 0.0)
+
+        disk_creds = Credentials(
+            token="stale-access-tok",
+            refresh_token=None,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id="cid",
+            client_secret="csecret",
+            scopes=drive_mod.DRIVE_SCOPES,
+        )
+        disk_creds.expiry = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
+
+        refreshed = {"called": False}
+
+        def fake_refresh(self, request):
+            refreshed["called"] = True
+            self.token = "new-access-tok"
+            self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("mcp_colab_gpu.drive.os.path.exists", return_value=True),
+            patch(
+                "mcp_colab_gpu.drive.Credentials.from_authorized_user_file",
+                return_value=disk_creds,
+            ),
+            patch.object(Credentials, "refresh", fake_refresh),
+            patch("mcp_colab_gpu.drive._save_drive_credentials"),
+        ):
+            os.environ.pop("MCP_DRIVE_TOKEN_MAX_AGE", None)
+            result = get_drive_credentials()
+
+        assert refreshed["called"] is True
+        assert result.token == "new-access-tok"
+        assert result.refresh_token == "cached-refresh-tok"
+
+
+class TestAuthModeOnline:
+    """MCP-COLAB-HARDEN: MCP_COLAB_AUTH_MODE="online" alternative for Drive auth."""
+
+    def test_online_mode_requests_online_access_type(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(drive_mod, "AUTH_MODE", "online")
+        monkeypatch.setattr(drive_mod, "TOKEN_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(drive_mod, "DRIVE_TOKEN_CACHE_PATH", str(tmp_path / "drive_token.json"))
+        monkeypatch.setattr(drive_mod, "_cached_drive_refresh_token", None)
+        monkeypatch.setattr(drive_mod, "_last_drive_token_time", 0.0)
+
+        new_creds = MagicMock()
+        new_creds.refresh_token = None
+        new_creds.to_json.return_value = json.dumps({
+            "token": "online-drive-tok",
+            "refresh_token": None,
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "scopes": drive_mod.DRIVE_SCOPES,
+        })
+
+        mock_flow = MagicMock()
+        mock_flow.run_local_server.return_value = new_creds
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("mcp_colab_gpu.drive.os.path.exists", return_value=False),
+            patch(
+                "mcp_colab_gpu.drive.InstalledAppFlow.from_client_config",
+                return_value=mock_flow,
+            ),
+        ):
+            os.environ.pop("MCP_DRIVE_TOKEN_MAX_AGE", None)
+            result = get_drive_credentials()
+
+        assert result is new_creds
+        mock_flow.run_local_server.assert_called_once()
+        assert mock_flow.run_local_server.call_args.kwargs["access_type"] == "online"
+        assert drive_mod._cached_drive_refresh_token is None
+
+    def test_hybrid_mode_requests_offline_access_type(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(drive_mod, "AUTH_MODE", "hybrid")
+        monkeypatch.setattr(drive_mod, "TOKEN_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(drive_mod, "DRIVE_TOKEN_CACHE_PATH", str(tmp_path / "drive_token.json"))
+        monkeypatch.setattr(drive_mod, "_cached_drive_refresh_token", None)
+        monkeypatch.setattr(drive_mod, "_last_drive_token_time", 0.0)
+
+        new_creds = MagicMock()
+        new_creds.refresh_token = "fresh-drive-refresh-tok"
+        new_creds.to_json.return_value = json.dumps({
+            "token": "hybrid-drive-tok",
+            "refresh_token": "fresh-drive-refresh-tok",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "scopes": drive_mod.DRIVE_SCOPES,
+        })
+
+        mock_flow = MagicMock()
+        mock_flow.run_local_server.return_value = new_creds
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("mcp_colab_gpu.drive.os.path.exists", return_value=False),
+            patch(
+                "mcp_colab_gpu.drive.InstalledAppFlow.from_client_config",
+                return_value=mock_flow,
+            ),
+        ):
+            os.environ.pop("MCP_DRIVE_TOKEN_MAX_AGE", None)
+            get_drive_credentials()
+
+        assert mock_flow.run_local_server.call_args.kwargs["access_type"] == "offline"
