@@ -17,7 +17,7 @@ from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .colab_runtime import AUTH_MODE, TOKEN_CACHE_DIR
+from .colab_runtime import AUTH_MODE, REVOKE_URL, TOKEN_CACHE_DIR
 
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
@@ -64,6 +64,11 @@ _last_drive_token_time: float = 0.0
 # new access tokens. (MCP-COLAB-HARDEN)
 _cached_drive_refresh_token: str | None = None
 
+# In-memory cache of the current Drive access token, used only to
+# revoke the grant on shutdown (see revoke_drive_credentials).
+# (MCP-COLAB-HARDEN)
+_cached_drive_access_token: str | None = None
+
 
 def _drive_query_escape(value: str) -> str:
     """Escape a value for use in a Google Drive API query string."""
@@ -83,7 +88,7 @@ def get_drive_credentials() -> Credentials:
     even when the underlying ``Credentials`` object still reports itself
     as valid.  This is used for E2E testing with a short TTL (e.g. 60 s).
     """
-    global _last_drive_token_time, _cached_drive_refresh_token  # noqa: PLW0603
+    global _last_drive_token_time, _cached_drive_refresh_token, _cached_drive_access_token  # noqa: PLW0603
 
     max_age_env = os.environ.get("MCP_DRIVE_TOKEN_MAX_AGE")
     max_token_age: int | None = int(max_age_env) if max_age_env else None
@@ -114,6 +119,7 @@ def get_drive_credentials() -> Credentials:
                 _cached_drive_refresh_token = creds.refresh_token
                 _save_drive_credentials(creds)
                 _last_drive_token_time = time.time()
+                _cached_drive_access_token = creds.token
                 return creds
             except Exception:
                 creds = None
@@ -165,7 +171,30 @@ def get_drive_credentials() -> Credentials:
     if creds.refresh_token:
         _cached_drive_refresh_token = creds.refresh_token
 
+    _cached_drive_access_token = creds.token
+
     return creds
+
+
+def revoke_drive_credentials() -> None:
+    """Best-effort revoke of the cached Drive access token (and its grant).
+
+    See colab_runtime.revoke_credentials -- same semantics, separate
+    grant. (MCP-COLAB-HARDEN)
+    """
+    global _cached_drive_refresh_token, _cached_drive_access_token  # noqa: PLW0603
+
+    token = _cached_drive_access_token
+    if not token:
+        return
+
+    try:
+        requests.post(REVOKE_URL, params={"token": token}, timeout=5)
+    except Exception as e:
+        print(f"[colab-gpu] Warning: Drive token revoke failed ({e})", file=sys.stderr)
+
+    _cached_drive_access_token = None
+    _cached_drive_refresh_token = None
 
 
 def _save_drive_credentials(creds: Credentials) -> None:

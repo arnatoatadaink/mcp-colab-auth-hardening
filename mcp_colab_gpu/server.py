@@ -27,6 +27,7 @@ import re
 import time
 import zipfile
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 from .background import JobStatus, JobStore, run_background_job
@@ -35,6 +36,7 @@ from .colab_runtime import (
     create_session,
     execute_code,
     get_credentials,
+    revoke_credentials,
     start_keepalive,
     unassign_runtime,
     validate_params,
@@ -59,12 +61,33 @@ _background_tasks: dict[str, asyncio.Task] = {}
 # ---------------------------------------------------------------------------
 
 
+def _revoke_all_credentials() -> None:
+    """Best-effort revoke of cached OAuth grants on shutdown.
+
+    Revoking the access token invalidates the whole grant (including
+    the in-memory refresh token), so a deliberate shutdown of the
+    persistent server requires one browser re-consent on next start.
+    (MCP-COLAB-HARDEN)
+    """
+    try:
+        revoke_credentials()
+    except Exception:
+        logger.exception("colab credential revoke failed during shutdown")
+    try:
+        from .drive import revoke_drive_credentials
+
+        revoke_drive_credentials()
+    except Exception:
+        logger.exception("drive credential revoke failed during shutdown")
+
+
 def _shutdown() -> None:
-    """Cancel active background tasks on server shutdown."""
+    """Cancel active background tasks and revoke cached OAuth grants on shutdown."""
     for job_id, task in list(_background_tasks.items()):
         if not task.done():
             task.cancel()
             logger.info("Cancelled background task %s during shutdown", job_id)
+    _revoke_all_credentials()
 
 
 atexit.register(_shutdown)
@@ -1009,8 +1032,41 @@ async def colab_version() -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _run_streamable_http() -> None:
+    """Run the streamable-http transport, revoking OAuth grants on exit.
+
+    uvicorn installs its own SIGINT/SIGTERM handlers that make
+    Server.serve() return normally (should_exit=True) instead of
+    raising, so this `finally` block runs the revoke on `kill <pid>`
+    too -- not just on a clean interpreter exit, which `atexit` alone
+    would miss for SIGTERM. (MCP-COLAB-HARDEN)
+    """
+    import uvicorn
+
+    app = mcp.streamable_http_app()
+    config = uvicorn.Config(
+        app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+    try:
+        await server.serve()
+    finally:
+        _revoke_all_credentials()
+
+
 def main():
-    mcp.run(transport="stdio")
+    transport = os.environ.get("MCP_COLAB_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.settings.host = os.environ.get("MCP_COLAB_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.environ.get("MCP_COLAB_PORT", "8765"))
+        anyio.run(_run_streamable_http)
+    elif transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        raise ValueError(f"Unknown MCP_COLAB_TRANSPORT: {transport!r} (must be 'stdio' or 'streamable-http')")
 
 
 if __name__ == "__main__":

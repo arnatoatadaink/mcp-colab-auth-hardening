@@ -67,6 +67,12 @@ TOKEN_CACHE_PATH = os.path.join(TOKEN_CACHE_DIR, "token.json")
 # process must re-consent once via the browser. (MCP-COLAB-HARDEN)
 _cached_refresh_token: str | None = None
 
+# In-memory cache of the current access token, used only to revoke the
+# grant on shutdown (see revoke_credentials). (MCP-COLAB-HARDEN)
+_cached_access_token: str | None = None
+
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+
 HIGHMEM_REQUIRED_ACCELERATORS = {"V5E1", "V6E1"}
 VALID_ACCELERATORS = {"T4", "L4", "A100", "H100", "G4", "V5E1", "V6E1"}
 MAX_TIMEOUT = 3600
@@ -102,7 +108,7 @@ def get_credentials() -> Credentials:
     that refresh token is only ever held in _cached_refresh_token
     (process memory) -- see _save_credentials.
     """
-    global _cached_refresh_token  # noqa: PLW0603
+    global _cached_refresh_token, _cached_access_token  # noqa: PLW0603
 
     creds = None
 
@@ -133,7 +139,35 @@ def get_credentials() -> Credentials:
     if creds.refresh_token:
         _cached_refresh_token = creds.refresh_token
 
+    _cached_access_token = creds.token
+
     return creds
+
+
+def revoke_credentials() -> None:
+    """Best-effort revoke of the cached access token (and its grant).
+
+    Revoking an access token via Google's /revoke endpoint invalidates
+    the whole grant, including the refresh token -- so after a
+    deliberate shutdown, the next start requires one browser
+    re-consent. This is intended for the persistent streamable-http
+    server's shutdown path: it bounds how long the in-memory
+    _cached_refresh_token (MCP-COLAB-HARDEN) stays usable if the
+    process were ever compromised after exit. (MCP-COLAB-HARDEN)
+    """
+    global _cached_refresh_token, _cached_access_token  # noqa: PLW0603
+
+    token = _cached_access_token
+    if not token:
+        return
+
+    try:
+        requests.post(REVOKE_URL, params={"token": token}, timeout=5)
+    except Exception as e:
+        print(f"[colab-gpu] Warning: token revoke failed ({e})", file=sys.stderr)
+
+    _cached_access_token = None
+    _cached_refresh_token = None
 
 
 def _save_credentials(creds: Credentials):
